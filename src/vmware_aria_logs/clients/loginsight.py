@@ -115,8 +115,21 @@ class LogInsightClient:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        _retried: bool = False,
     ) -> Any:
         status, body = self._request_raw(method=method, path=path, payload=payload)
+        if (
+            status == 401
+            and not _retried
+            and path != "/api/v2/sessions"
+            and self.username
+        ):
+            # Session token likely expired -- re-login once and retry.
+            self.token = ""
+            self.authenticate()
+            return self._request_json(
+                method=method, path=path, payload=payload, _retried=True
+            )
         if status >= 400:
             raise LogInsightError(f"HTTP {status} for {method} {path}: {body[:400]}")
         try:

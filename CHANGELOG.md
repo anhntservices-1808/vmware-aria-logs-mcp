@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 (2026-06-17)
+
+- fix(auth): auto re-login on HTTP 401 in LogInsightClient._request_json.
+  Long-lived HTTP-server process previously held a stale vLI session token
+  until manual container restart. Now a single re-auth + retry happens on 401
+  (excludes /api/v2/sessions, capped at one retry to avoid lockout loops).
+
 ## 0.1.0 (2026-04-06)
 
 - Initial release
