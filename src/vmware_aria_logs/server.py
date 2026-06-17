@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .analysis.events import dedupe_events
 from .analysis.incidents import detect_mass_incidents, incidents_to_dicts
@@ -24,9 +25,39 @@ def _parse_int_env(name: str, default: int) -> int:
         raise LogInsightError(f"{name} must be an integer, got: {raw!r}") from None
 
 
+def _build_transport_security() -> TransportSecuritySettings:
+    """Build transport security settings for the streamable-HTTP transport.
+
+    The MCP SDK enables DNS-rebinding protection by default, which rejects
+    requests whose Host header is not in an allow-list (HTTP 421 when reached
+    via an IP/hostname other than localhost). Behind Tailscale + a read-only
+    container this adds little, so it is disabled by default and can be
+    re-enabled via env:
+
+      MCP_DNS_REBINDING_PROTECTION=true   -> enforce allow-lists
+      MCP_ALLOWED_HOSTS=host1,host2        -> allowed Host headers (when enforced)
+      MCP_ALLOWED_ORIGINS=origin1,origin2  -> allowed Origin headers (when enforced)
+    """
+    enabled = os.environ.get("MCP_DNS_REBINDING_PROTECTION", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    hosts = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    origins = [
+        o.strip() for o in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()
+    ]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=enabled,
+        allowed_hosts=hosts or ["*"],
+        allowed_origins=origins or ["*"],
+    )
+
+
 mcp = FastMCP(
     "vmware-aria-logs",
     instructions="VMware Aria Operations for Logs (Log Insight) — log search, incident detection, vROps correlation",
+    transport_security=_build_transport_security(),
 )
 
 # ---------------------------------------------------------------------------
