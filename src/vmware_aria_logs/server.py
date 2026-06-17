@@ -368,28 +368,51 @@ def aggregate_events(
     top_n = max(1, min(top_n, 100))
     if len(group_by_field) > 128:
         return json.dumps({"error": "group_by_field exceeds 128 characters"})
+    # Pass 1: grouped aggregation to discover candidate keys (approximate,
+    # may be truncated by the appliance's ~100-bin cap).
     payload = client.query_aggregated(
         lookback_minutes=lookback_minutes,
         group_by_field=group_by_field,
         term=search_term,
     )
-    totals: dict[str, float] = {}
+    approx: dict[str, float] = {}
     for b in payload.get("bins", []):
         if not isinstance(b, dict):
             continue
         keys = b.get("keys") or []
         key = keys[0] if isinstance(keys, list) and keys else "(all)"
         try:
-            totals[key] = totals.get(key, 0) + float(b.get("value", 0) or 0)
+            approx[key] = approx.get(key, 0) + float(b.get("value", 0) or 0)
         except (TypeError, ValueError):
             continue
-    ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+    # Candidates: take more than top_n to survive re-ranking, cap the number
+    # of exact-count calls for latency.
+    candidates = sorted(approx.items(), key=lambda kv: kv[1], reverse=True)
+    candidates = [k for k, _ in candidates if k and k != "(all)"][: min(top_n * 2, 25)]
+    # Pass 2: exact, stable per-key count via single-group aggregation.
+    exact: list[dict[str, Any]] = []
+    for key in candidates:
+        try:
+            c = client.count_events(
+                lookback_minutes=lookback_minutes,
+                term=search_term,
+                constraints=[
+                    EventConstraint(
+                        field_name=group_by_field, operator="EQ", value=key
+                    )
+                ],
+            )
+        except (LogInsightError, ValueError):
+            c = int(approx.get(key, 0))
+        exact.append({"key": key, "count": c})
+    exact.sort(key=lambda d: d["count"], reverse=True)
     return json.dumps(
         {
             "group_by_field": group_by_field,
             "lookback_minutes": lookback_minutes,
-            "distinct_groups": len(totals),
-            "top": [{"key": k, "count": int(v)} for k, v in ranked],
+            "candidates_examined": len(candidates),
+            "method": "exact per-key count (2-pass)",
+            "top": exact[:top_n],
         },
         ensure_ascii=False,
         indent=2,

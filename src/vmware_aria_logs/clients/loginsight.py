@@ -303,6 +303,34 @@ class LogInsightClient:
         payload = self._request_json(method="GET", path=path)
         return payload if isinstance(payload, dict) else {"bins": []}
 
+    def count_events(
+        self,
+        *,
+        lookback_minutes: int = 60,
+        term: str = "",
+        constraints: list[EventConstraint] | None = None,
+    ) -> int:
+        """Exact total event count over a window (sum of aggregation bins).
+
+        Unlike a grouped aggregation, a single-group COUNT fits within the
+        appliance's ~100-bin response, so the summed total is exact and
+        stable across calls. Use with a field constraint (e.g. source EQ x)
+        for reliable per-entity counts.
+        """
+        payload = self.query_aggregated(
+            lookback_minutes=lookback_minutes,
+            term=term,
+            constraints=constraints,
+        )
+        total = 0.0
+        for b in payload.get("bins", []):
+            if isinstance(b, dict):
+                try:
+                    total += float(b.get("value", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+        return int(total)
+
     def list_alerts(self) -> list[dict[str, Any]]:
         """List configured alert definitions (on-prem ``/api/v2/alerts``)."""
         if not self.token:
