@@ -302,9 +302,49 @@ def get_vrops_alerts(resource_ids: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _build_http_app():
+    """Build the Starlette ASGI app for streamable-HTTP transport.
+
+    Wraps the MCP streamable-HTTP app under ``/`` and adds a lightweight
+    ``/health`` route for container/nginx health checks. Routes are declared
+    upfront (rather than mutating an existing router) so this stays robust if
+    the MCP SDK ever returns a compiled/wrapped ASGI app.
+    """
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Mount, Route
+
+    mcp_app = mcp.streamable_http_app()
+
+    async def _health(_request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "service": "vmware-aria-logs-mcp"})
+
+    return Starlette(
+        routes=[
+            Route("/health", _health, methods=["GET"]),
+            Mount("/", app=mcp_app),
+        ],
+        lifespan=lambda app: mcp_app.router.lifespan_context(mcp_app),
+    )
+
+
 def main() -> None:
-    """Run the MCP server (stdio transport)."""
-    mcp.run(transport="stdio")
+    """Run the MCP server.
+
+    Transport is selected via the ``MCP_TRANSPORT`` env var:
+      - ``stdio`` (default): classic stdio transport, spawn-per-call.
+      - ``http`` / ``streamable-http``: long-running streamable-HTTP server
+        bound to ``MCP_HOST``:``MCP_PORT`` (default 0.0.0.0:8770), MCP at /mcp.
+    """
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
+    if transport in ("http", "streamable-http", "streamable_http"):
+        import uvicorn
+
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = _parse_int_env("MCP_PORT", 8770)
+        uvicorn.run(_build_http_app(), host=host, port=port)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
