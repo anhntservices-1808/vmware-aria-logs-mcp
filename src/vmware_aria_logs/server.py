@@ -203,15 +203,27 @@ def get_version() -> str:
 def list_dashboards() -> str:
     """List saved dashboards from Aria Operations for Logs.
 
-    Uses the legacy vRLIC API (``/vrlic/api/v1/content/dashboards``).
-    This endpoint was deprecated in Aria Operations for Logs 8.18+
-    and will return an empty result on newer appliances.
+    NOTE: On-premise Aria Operations for Logs (vRealize Log Insight) does not
+    expose a REST endpoint to list dashboards. The ``/vrlic/...`` content API
+    only exists on the vRLI *Cloud* service. On an on-prem appliance every
+    dashboard path returns 404, so this tool reports that clearly instead of
+    silently returning empty. Use ``list_alerts`` for configured alerting, or
+    the appliance web UI to view dashboards.
     """
     client = _get_li_client()
     dashboards = client.list_dashboards()
-    if not dashboards:
-        return json.dumps({"message": "No dashboards found or legacy API unavailable"})
-    return json.dumps(dashboards[:50], ensure_ascii=False, indent=2)
+    if dashboards:
+        return json.dumps(dashboards[:50], ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "message": "Dashboard listing is not available via REST on on-prem "
+            "Aria Operations for Logs (Cloud-only /vrlic API). "
+            "Use list_alerts or the web UI instead.",
+            "supported": False,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -326,6 +338,137 @@ def get_vrops_alerts(resource_ids: str) -> str:
         for a in alerts[:50]
     ]
     return json.dumps(compact, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def aggregate_events(
+    lookback_minutes: int = 60,
+    group_by_field: str = "source",
+    search_term: str = "",
+    top_n: int = 10,
+) -> str:
+    """Server-side aggregation: count events grouped by a field (top talkers).
+
+    Far more accurate than client-side counting for "top N hosts/sources"
+    questions, because the appliance aggregates across ALL events (no 10k
+    fetch cap).
+
+    Args:
+        lookback_minutes: How far back to aggregate (default 60).
+        group_by_field: Field to group by (e.g. 'source', 'hostname',
+            'appname', 'vmw_host'). Use list_fields to discover names.
+        search_term: Optional free-text filter before aggregation.
+        top_n: Number of top groups to return (default 10, max 100).
+
+    Returns:
+        JSON with ranked groups [{key, count}] sorted by count desc.
+    """
+    client = _get_li_client()
+    lookback_minutes = max(1, min(lookback_minutes, 10_080))
+    top_n = max(1, min(top_n, 100))
+    if len(group_by_field) > 128:
+        return json.dumps({"error": "group_by_field exceeds 128 characters"})
+    payload = client.query_aggregated(
+        lookback_minutes=lookback_minutes,
+        group_by_field=group_by_field,
+        term=search_term,
+    )
+    totals: dict[str, float] = {}
+    for b in payload.get("bins", []):
+        if not isinstance(b, dict):
+            continue
+        keys = b.get("keys") or []
+        key = keys[0] if isinstance(keys, list) and keys else "(all)"
+        try:
+            totals[key] = totals.get(key, 0) + float(b.get("value", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+    return json.dumps(
+        {
+            "group_by_field": group_by_field,
+            "lookback_minutes": lookback_minutes,
+            "distinct_groups": len(totals),
+            "top": [{"key": k, "count": int(v)} for k, v in ranked],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool()
+def list_alerts(only_enabled: bool = False, limit: int = 100) -> str:
+    """List configured alert definitions in Aria Operations for Logs.
+
+    Shows what the appliance is actively watching for (thresholds, hit
+    counts, recipients) — far more useful on-prem than dashboards.
+
+    Args:
+        only_enabled: If True, return only enabled alerts.
+        limit: Max alerts to return (default 100, max 500).
+
+    Returns:
+        JSON array of alert definitions (compacted).
+    """
+    client = _get_li_client()
+    limit = max(1, min(limit, 500))
+    alerts = client.list_alerts()
+    if only_enabled:
+        alerts = [a for a in alerts if a.get("enabled")]
+    compact = [
+        {
+            "name": a.get("name", ""),
+            "enabled": a.get("enabled"),
+            "type": a.get("type", ""),
+            "hitCount": a.get("hitCount", 0),
+            "hitOperator": a.get("hitOperator", ""),
+            "info": (a.get("info") or "")[:200],
+            "recipients": a.get("recipients", ""),
+        }
+        for a in alerts[:limit]
+    ]
+    return json.dumps(
+        {"total": len(alerts), "alerts": compact}, ensure_ascii=False, indent=2
+    )
+
+
+@mcp.tool()
+def list_fields(name_filter: str = "", limit: int = 100) -> str:
+    """List log fields available for querying/aggregation.
+
+    Use this to discover valid field names (incl. custom CF_* fields) before
+    using field constraints in query_events or aggregate_events.
+
+    Args:
+        name_filter: Optional case-insensitive substring filter on field name.
+        limit: Max fields to return (default 100, max 1000).
+
+    Returns:
+        JSON array of fields with internalName, displayName, fieldType.
+    """
+    client = _get_li_client()
+    limit = max(1, min(limit, 1000))
+    fields = client.list_fields()
+    nf = name_filter.strip().lower()
+    if nf:
+        fields = [
+            f
+            for f in fields
+            if nf in str(f.get("internalName", "")).lower()
+            or nf in str(f.get("displayName", "")).lower()
+        ]
+    compact = [
+        {
+            "internalName": f.get("internalName", ""),
+            "displayName": f.get("displayName", ""),
+            "fieldType": f.get("fieldType", ""),
+            "static": f.get("isStatic", False),
+        }
+        for f in fields[:limit]
+    ]
+    return json.dumps(
+        {"total": len(fields), "fields": compact}, ensure_ascii=False, indent=2
+    )
 
 
 # ---------------------------------------------------------------------------

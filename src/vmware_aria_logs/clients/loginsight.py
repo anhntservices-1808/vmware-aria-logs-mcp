@@ -254,6 +254,83 @@ class LogInsightClient:
                 return items
         return []
 
+    def query_aggregated(
+        self,
+        *,
+        lookback_minutes: int = 60,
+        group_by_field: str = "",
+        term: str = "",
+        constraints: list[EventConstraint] | None = None,
+        aggregation_function: str = "COUNT",
+    ) -> dict[str, Any]:
+        """Run a server-side aggregation (COUNT/UCOUNT) over events.
+
+        Returns the raw aggregation payload with ``bins``. When
+        ``group_by_field`` is set, each bin includes a ``keys`` list
+        identifying the group it counts.
+        """
+        if not self.token:
+            self.authenticate()
+        parts = [
+            urllib.parse.quote("timestamp", safe=""),
+            urllib.parse.quote(f"LAST {max(lookback_minutes, 1) * 60_000}", safe=""),
+        ]
+        if term:
+            parts.extend(
+                [
+                    urllib.parse.quote("text", safe=""),
+                    urllib.parse.quote("CONTAINS", safe="")
+                    + "%20"
+                    + urllib.parse.quote(term.strip(), safe=""),
+                ]
+            )
+        for c in constraints or []:
+            parts.extend(
+                [
+                    urllib.parse.quote(c.field_name, safe=""),
+                    urllib.parse.quote(c.operator, safe="")
+                    + "%20"
+                    + urllib.parse.quote(c.value, safe=""),
+                ]
+            )
+        query: dict[str, str] = {"aggregation-function": aggregation_function}
+        if group_by_field:
+            query["group-by-field"] = group_by_field
+        path = (
+            f"/api/v2/aggregated-events/{'/'.join(parts)}?"
+            + urllib.parse.urlencode(query)
+        )
+        payload = self._request_json(method="GET", path=path)
+        return payload if isinstance(payload, dict) else {"bins": []}
+
+    def list_alerts(self) -> list[dict[str, Any]]:
+        """List configured alert definitions (on-prem ``/api/v2/alerts``)."""
+        if not self.token:
+            self.authenticate()
+        payload = self._request_json(method="GET", path="/api/v2/alerts")
+        if isinstance(payload, list):
+            return [a for a in payload if isinstance(a, dict)]
+        if isinstance(payload, dict):
+            for key in ("alerts", "alert", "items"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return [a for a in value if isinstance(a, dict)]
+        return []
+
+    def list_fields(self) -> list[dict[str, Any]]:
+        """List available log fields (on-prem ``/api/v2/fields``)."""
+        if not self.token:
+            self.authenticate()
+        payload = self._request_json(method="GET", path="/api/v2/fields")
+        if isinstance(payload, list):
+            return [f for f in payload if isinstance(f, dict)]
+        if isinstance(payload, dict):
+            for key in ("fields", "items"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return [f for f in value if isinstance(f, dict)]
+        return []
+
 
 def _extract_events(payload: Any) -> list[dict[str, Any]]:
     """Extract event list from various API response shapes."""
