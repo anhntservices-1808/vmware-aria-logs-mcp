@@ -5,6 +5,7 @@ Exposes Log Insight API v2 and optional vROps correlation as MCP tools.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from mcp.server.fastmcp import FastMCP
@@ -516,9 +517,50 @@ def _build_http_app():
     async def _health(_request) -> JSONResponse:
         return JSONResponse({"status": "ok", "service": "vmware-aria-logs-mcp"})
 
+    # Readiness: actually exercises the vLI backend (auth + reachability),
+    # not just process liveness. Result is cached briefly so monitoring /
+    # other agents can poll without hammering vLI (avoids lockout).
+    _ready_cache: dict[str, Any] = {"ts": 0.0, "ok": False, "detail": ""}
+    _ready_ttl_sec = _parse_int_env("READY_CACHE_TTL_SEC", 30)
+
+    async def _ready(_request) -> JSONResponse:
+        import time as _time
+
+        now = _time.monotonic()
+        if now - _ready_cache["ts"] < _ready_ttl_sec:
+            ready = bool(_ready_cache["ok"])
+            return JSONResponse(
+                {
+                    "status": "ready" if ready else "not_ready",
+                    "backend": _ready_cache["detail"],
+                    "cached": True,
+                },
+                status_code=200 if ready else 503,
+            )
+        ok = False
+        detail = ""
+        try:
+            client = _get_li_client()
+            version = await asyncio.to_thread(client.get_version)
+            ok = isinstance(version, dict) and bool(version.get("version"))
+            detail = str(version.get("version", "")) if isinstance(version, dict) else ""
+        except Exception as exc:  # noqa: BLE001 - report any backend failure
+            ok = False
+            detail = f"{type(exc).__name__}: {str(exc)[:200]}"
+        _ready_cache.update({"ts": now, "ok": ok, "detail": detail})
+        return JSONResponse(
+            {
+                "status": "ready" if ok else "not_ready",
+                "backend": detail,
+                "cached": False,
+            },
+            status_code=200 if ok else 503,
+        )
+
     return Starlette(
         routes=[
             Route("/health", _health, methods=["GET"]),
+            Route("/ready", _ready, methods=["GET"]),
             Mount("/", app=mcp_app),
         ],
         lifespan=lambda app: mcp_app.router.lifespan_context(mcp_app),
