@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,6 +14,12 @@ from typing import Any
 
 class LogInsightError(RuntimeError):
     """Raised when a Log Insight API call fails."""
+
+
+# HTTP statuses that indicate the session token is expired/invalid and a
+# single re-login + retry is warranted. vLI returns 440 "Login Timeout"
+# for an expired session id; 401 covers a rejected/blank token.
+_AUTH_EXPIRED_STATUSES = frozenset({401, 440})
 
 
 VALID_OPERATORS = frozenset(
@@ -64,6 +71,10 @@ class LogInsightClient:
     verify_tls: bool = False
     timeout_sec: int = 30
     token: str = field(default="", repr=False)
+    # Proactive token lifecycle: refresh before the vLI session TTL expires.
+    _token_expiry: float = field(default=0.0, repr=False)
+    # Safety margin (seconds) subtracted from the TTL so we refresh early.
+    token_refresh_buffer_sec: int = 60
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
@@ -119,13 +130,14 @@ class LogInsightClient:
     ) -> Any:
         status, body = self._request_raw(method=method, path=path, payload=payload)
         if (
-            status == 401
+            status in _AUTH_EXPIRED_STATUSES
             and not _retried
             and path != "/api/v2/sessions"
             and self.username
         ):
-            # Session token likely expired -- re-login once and retry.
-            self.token = ""
+            # Session token expired/invalid (401 Unauthorized or
+            # 440 Login Timeout) -- invalidate, re-login once, and retry.
+            self._invalidate_token()
             self.authenticate()
             return self._request_json(
                 method=method, path=path, payload=payload, _retried=True
@@ -159,7 +171,32 @@ class LogInsightClient:
         if not token:
             raise LogInsightError("auth succeeded but no session id returned")
         self.token = token
+        # Record when this session token should be proactively refreshed.
+        ttl_raw = response.get("ttl")
+        try:
+            ttl = float(ttl_raw) if ttl_raw is not None else 1800.0
+        except (TypeError, ValueError):
+            ttl = 1800.0
+        # Never let the effective lifetime collapse to <= 0 from the buffer.
+        effective = max(ttl - self.token_refresh_buffer_sec, ttl * 0.5, 1.0)
+        self._token_expiry = time.monotonic() + effective
         return token
+
+    def _invalidate_token(self) -> None:
+        """Drop the cached session token, forcing a fresh login next time."""
+        self.token = ""
+        self._token_expiry = 0.0
+
+    def _ensure_token(self) -> None:
+        """Proactively (re)authenticate before the session TTL expires.
+
+        Logs in when there is no token, or when the cached token is at/past
+        its refresh deadline. This is the primary auth mechanism; the
+        401/440 retry in ``_request_json`` is only a safety net.
+        """
+        if not self.token or time.monotonic() >= self._token_expiry:
+            self._invalidate_token()
+            self.authenticate()
 
     def _build_events_path(
         self,
@@ -202,8 +239,7 @@ class LogInsightClient:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Query events from Log Insight. Returns list of event dicts."""
-        if not self.token:
-            self.authenticate()
+        self._ensure_token()
         path = self._build_events_path(
             lookback_minutes=lookback_minutes,
             term=term,
@@ -215,13 +251,23 @@ class LogInsightClient:
 
     def get_version(self) -> dict[str, Any]:
         """Get appliance version info."""
-        if not self.token:
-            self.authenticate()
+        self._ensure_token()
         return self._request_json(method="GET", path="/api/v2/version")
 
     def probe_endpoint(self, *, method: str, path: str) -> dict[str, Any]:
         """Probe an API endpoint and return availability info."""
+        self._ensure_token()
         status, body = self._request_raw(method=method, path=path)
+        if (
+            status in _AUTH_EXPIRED_STATUSES
+            and path != "/api/v2/sessions"
+            and self.username
+        ):
+            # Probe bypasses _request_json's retry, so handle an expired/invalid
+            # session here too: invalidate, re-login once, and probe again.
+            self._invalidate_token()
+            self.authenticate()
+            status, body = self._request_raw(method=method, path=path)
         parsed: Any = None
         if body.strip():
             try:
@@ -250,8 +296,7 @@ class LogInsightClient:
         starting in Aria Operations for Logs 8.18.  On 8.18+ appliances this
         method will return an empty list (probe verdict "unavailable").
         """
-        if not self.token:
-            self.authenticate()
+        self._ensure_token()
         result = self.probe_endpoint(
             method="GET", path="/vrlic/api/v1/content/dashboards"
         )
@@ -346,8 +391,7 @@ class LogInsightClient:
 
     def list_alerts(self) -> list[dict[str, Any]]:
         """List configured alert definitions (on-prem ``/api/v2/alerts``)."""
-        if not self.token:
-            self.authenticate()
+        self._ensure_token()
         payload = self._request_json(method="GET", path="/api/v2/alerts")
         if isinstance(payload, list):
             return [a for a in payload if isinstance(a, dict)]
@@ -360,8 +404,7 @@ class LogInsightClient:
 
     def list_fields(self) -> list[dict[str, Any]]:
         """List available log fields (on-prem ``/api/v2/fields``)."""
-        if not self.token:
-            self.authenticate()
+        self._ensure_token()
         payload = self._request_json(method="GET", path="/api/v2/fields")
         if isinstance(payload, list):
             return [f for f in payload if isinstance(f, dict)]
